@@ -150,4 +150,21 @@ impl L10n {
             Lang::En => "checksum verified",
         }
     }
+
+    /// Column headers for the `dns://` results table: (host, target, type).
+    pub fn dns_table_header(&self) -> (&'static str, &'static str, &'static str) {
+        match self.lang {
+            Lang::Zh => ("主机域名", "主机目标", "记录类型"),
+            Lang::En => ("Hostname", "Target", "Record type"),
+        }
+    }
+
+    /// Label for one row's record type in the `dns://` results table, given its
+    /// type code (`"A"`, `"AAAA"`, `"MX"`, …).
+    pub fn dns_record_type(&self, code: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!("{code} 类型"),
+            Lang::En => format!("{code} record"),
+        }
+    }
 }

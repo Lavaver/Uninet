@@ -23,6 +23,7 @@ reporting, checksum verification, resume, retry, and file-lock handling.
 - [Parallel segmented downloads](#parallel-segmented-downloads)
 - [WebSocket](#websocket)
 - [UDP and DNS](#udp-and-dns)
+- [Piped-script protection](#piped-script-protection)
 - [Development](#development)
 - [License](#license)
 
@@ -50,6 +51,10 @@ reporting, checksum verification, resume, retry, and file-lock handling.
   verbose modes, `--write-out` formatting, and `--lang en|zh` bilingual output.
 - **Windows Terminal integration**: the tab progress ring reflects aggregate
   download progress.
+- **Piped-script protection**: by default, an HTTP(S) text body written to
+  stdout has a zero-width space inserted between every character, so piping it
+  straight into a shell no longer executes untrusted text while it still renders
+  identically (see [Piped-script protection](#piped-script-protection)).
 
 ## Installation
 
@@ -64,17 +69,17 @@ The resulting binary is `target/release/webclient` (`webclient.exe` on Windows).
 
 ## Supported protocols
 
-| Scheme                | Description                                              |
-|-----------------------|----------------------------------------------------------|
-| `http://`, `https://` | HTTP(S) with redirects, ranges, resume, and `--segments` |
-| `ws://`, `wss://`     | WebSocket client                                         |
-| `udp://`              | Generic UDP send/receive and streaming                   |
-| `dns://`              | DNS query (A and AAAA records) over UDP                  |
-| `file://`             | Local file                                               |
-| `data:`               | `data:` URI                                              |
-| `gopher://`           | Gopher                                                   |
-| `ftp://`, `ftps://`   | FTP and explicit FTPS                                    |
-| `sftp://`, `scp://`   | SSH file transfer                                        |
+| Scheme                | Description                                                          |
+|-----------------------|----------------------------------------------------------------------|
+| `http://`, `https://` | HTTP(S) with redirects, ranges, resume, and `--segments`             |
+| `ws://`, `wss://`     | WebSocket client                                                     |
+| `udp://`              | Generic UDP send/receive and streaming                               |
+| `dns://`              | DNS query (A, AAAA, CNAME, MX, TXT, NS, SOA, PTR, SRV, CAA) over UDP |
+| `file://`             | Local file                                                           |
+| `data:`               | `data:` URI                                                          |
+| `gopher://`           | Gopher                                                               |
+| `ftp://`, `ftps://`   | FTP and explicit FTPS                                                |
+| `sftp://`, `scp://`   | SSH file transfer                                                    |
 
 ## Usage
 
@@ -130,6 +135,58 @@ webclient dns://example.com
 webclient dns://8.8.8.8/example.com
 ```
 
+## Piped-script protection
+
+By default, when an HTTP(S) **text** body is written to stdout, Uninet Client
+inserts an invisible zero-width space (U+200B) between every character. The
+text renders identically in a terminal, but piping it straight into a shell —
+
+```sh
+webclient http://example.com/install.sh | sh     # no longer executes
+webclient http://example.com/setup.ps1 | iex     # no longer executes
+```
+
+— no longer runs the fetched script. This guards against pipe-to-shell attacks
+where a compromised or untrusted URL serves a script.
+
+The guard is applied only to text content, decided by the `Content-Type` header:
+`text/*`, JSON/XML/YAML, common script and markup types, and so on. Binary
+bodies (`image/*`, `application/octet-stream`, archives, video/audio, …) pass
+through unchanged, so `webclient <url> | tar xz` still works. A missing or
+unrecognised `Content-Type` is treated as text — the guard errs on the side of
+protecting.
+
+The guard can be disabled in two ways:
+
+- **Per invocation**, with `--no-control-characters`, when you trust the source.
+- **Per host**, by listing the host as trusted (below), which disables the guard
+  for that host whether or not the flag is passed.
+
+### Trusted hosts
+
+Hosts you explicitly trust are exempt from the guard. List them in a
+`trust-hosts.json` file placed next to the executable, or in the
+`UNIHOST_TRUST_HOSTS` environment variable:
+
+```json
+["example.com", "cdn.example.com:8443"]
+```
+
+```sh
+# Comma, semicolon or whitespace separated.
+export UNIHOST_TRUST_HOSTS="example.com, cdn.example.com:8443"
+```
+
+Matching is an exact, case-insensitive comparison of the hostname (or
+`host:port`); a bare hostname trusts that host on any port. Wildcards and
+regular expressions are deliberately not supported, so an entry names one
+fully-qualified host and nothing else. Uninet Client does not verify these
+sources or their scripts, and grants them no security warranty — mark a host
+trusted only when you are certain it cannot be used against you.
+
+> **Note:** file output (`-o`/`-O`), non-web schemes, and binary bodies are never
+> affected — the guard only touches text written to stdout.
+
 ## Command-line options
 
 | Option                       | Description                                                     |
@@ -172,6 +229,7 @@ webclient dns://8.8.8.8/example.com
 | `-k, --insecure`             | Skip TLS certificate verification (HTTP(S)).                    |
 | `--cacert FILE`              | Custom CA bundle for TLS (HTTP(S)).                             |
 | `--no-color`                 | Disable colored output.                                         |
+| `--no-control-characters`    | Disable the zero-width-space script-injection guard for stdout. |
 | `--lang en\|zh`              | Force the interface language.                                   |
 
 ## Exit codes
@@ -226,4 +284,4 @@ hashing, exit-code classification, redirect rules, filename derivation, and
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE.txt).

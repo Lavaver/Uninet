@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -22,6 +24,7 @@ use crate::protocol::{
     fetch_data, fetch_file, fetch_ftp, fetch_gopher, fetch_sftp, interrupted,
     FetchError, Resource, ResourceBody,
 };
+use crate::trust;
 use crate::udp::fetch_udp;
 use crate::ui::{format_bytes, Palette, BRAILLE};
 use crate::ws::fetch_ws;
@@ -605,6 +608,206 @@ where
     }
 }
 
+/// Incrementally inserts U+200B (zero-width space) between every UTF-8
+/// character, carrying a partial multi-byte sequence across chunk boundaries.
+/// The result is visually identical text that no longer parses as a script.
+struct ControlCharInjector {
+    /// Bytes of an incomplete UTF-8 sequence at the end of the previous chunk.
+    carry: Vec<u8>,
+    /// Whether any character has been emitted yet. A separator precedes every
+    /// character after the first.
+    started: bool,
+}
+
+impl ControlCharInjector {
+    fn new() -> Self {
+        Self {
+            carry: Vec::new(),
+            started: false,
+        }
+    }
+
+    /// Feed one chunk; returns the transformed bytes, minus any trailing
+    /// incomplete UTF-8 sequence (held in `carry` until more bytes arrive).
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.carry.len() + chunk.len());
+        buf.extend_from_slice(&self.carry);
+        buf.extend_from_slice(chunk);
+
+        let mut out = Vec::with_capacity(buf.len().saturating_mul(4));
+        let mut i = 0;
+        while i < buf.len() {
+            match std::str::from_utf8(&buf[i..]) {
+                Ok(valid) => {
+                    for c in valid.chars() {
+                        self.emit(c, &mut out);
+                    }
+                    i = buf.len();
+                    break;
+                }
+                Err(e) => {
+                    let upto = e.valid_up_to();
+                    for c in std::str::from_utf8(&buf[i..i + upto])
+                        .expect("valid_up_to prefix is valid UTF-8")
+                        .chars()
+                    {
+                        self.emit(c, &mut out);
+                    }
+                    i += upto;
+                    if e.error_len().is_some() {
+                        // An invalid byte: pass it through verbatim (so binary
+                        // content is not silently dropped) and carry on.
+                        out.push(buf[i]);
+                        i += 1;
+                    } else {
+                        // Incomplete sequence at the end of the buffer; carry it.
+                        break;
+                    }
+                }
+            }
+        }
+        self.carry = buf[i..].to_vec();
+        out
+    }
+
+    fn emit(&mut self, c: char, out: &mut Vec<u8>) {
+        if self.started {
+            out.extend_from_slice("\u{200B}".as_bytes());
+        }
+        self.started = true;
+        let mut tmp = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+    }
+
+    /// Emit whatever incomplete tail remains (a truncated final character),
+    /// passing it through unchanged.
+    fn finish(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.carry.len() + 3);
+        if !self.carry.is_empty() {
+            if self.started {
+                out.extend_from_slice("\u{200B}".as_bytes());
+            }
+            out.extend_from_slice(&self.carry);
+            self.carry.clear();
+        }
+        out
+    }
+}
+
+/// Wraps a body stream and inserts U+200B between every character (see
+/// [`ControlCharInjector`]), so an untrusted script piped to a shell no longer
+/// executes.
+struct ControlCharStream<S> {
+    inner: S,
+    injector: ControlCharInjector,
+    finished: bool,
+}
+
+impl<S> ControlCharStream<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            injector: ControlCharInjector::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<S> Stream for ControlCharStream<S>
+where
+    S: Stream<Item = Result<Bytes>> + Unpin,
+{
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.finished {
+                return Poll::Ready(None);
+            }
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.finished = true;
+                    let tail = self.injector.finish();
+                    if tail.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    return Poll::Ready(Some(Ok(Bytes::from(tail))));
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(chunk))) => {
+                    let out = self.injector.feed(&chunk);
+                    if !out.is_empty() {
+                        return Poll::Ready(Some(Ok(Bytes::from(out))));
+                    }
+                    // The whole chunk was an incomplete UTF-8 prefix; poll the
+                    // inner stream again for the remaining bytes.
+                }
+            }
+        }
+    }
+}
+
+/// Whether a response body is text (worth guarding) as opposed to binary
+/// (which must pass through verbatim). Used by the stdout control-character
+/// guard: text gets the zero-width-space injection, binary does not.
+///
+/// A missing or unrecognised `Content-Type` is treated as text — the guard errs
+/// on the side of protecting, since a script can be served without a meaningful
+/// type. Pass `--no-control-characters` or trust the host to override.
+fn content_is_text(content_type: Option<&str>) -> bool {
+    let Some(raw) = content_type else {
+        return true;
+    };
+    let mime = raw
+        .split_once(';')
+        .map(|(mime, _)| mime)
+        .unwrap_or(raw)
+        .trim()
+        .to_ascii_lowercase();
+    if mime.is_empty() || mime.starts_with("text/") {
+        return true;
+    }
+    // Structured-text suffixes (`application/*+json`, `+xml`, `+yaml`).
+    if mime.ends_with("+json") || mime.ends_with("+xml") || mime.ends_with("+yaml") {
+        return true;
+    }
+    // Curated text-ish `application/*` types (scripts, markup, data exchange).
+    const TEXT: &[&str] = &[
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/javascript",
+        "application/x-javascript",
+        "application/ecmascript",
+        "application/typescript",
+        "application/x-sh",
+        "application/x-shellscript",
+        "application/x-csh",
+        "application/x-perl",
+        "application/x-python",
+        "application/x-python-code",
+        "application/x-ruby",
+        "application/x-httpd-php",
+        "application/x-lua",
+        "application/x-powershell",
+        "application/yaml",
+        "application/x-yaml",
+        "application/toml",
+        "application/graphql",
+        "application/sql",
+        "application/ld+json",
+        "application/vnd.api+json",
+        "application/rtf",
+        "application/x-www-form-urlencoded",
+        "image/svg+xml",
+    ];
+    TEXT.contains(&mime.as_str())
+}
+
 fn spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner} {msg}")
         .expect("valid template")
@@ -750,7 +953,7 @@ pub async fn execute(
             Ok(r) => r,
             Err(e) => return fetch_fail(e, pb, mp, live, silent, palette, job, l10n),
         },
-        Some("dns") => match fetch_dns(&job.url, args, rx.clone()).await {
+        Some("dns") => match fetch_dns(&job.url, args, l10n, rx.clone()).await {
             Ok(r) => r,
             Err(e) => return fetch_fail(e, pb, mp, live, silent, palette, job, l10n),
         },
@@ -1606,6 +1809,26 @@ async fn transfer(
         pb.set_position(0);
     }
 
+    // Guard against script-injection-by-pipe: for an untrusted HTTP(S) source
+    // serving text, insert U+200B between every character of the body so that
+    // `webclient <url> | sh` (or `| iex`) no longer runs the fetched text while
+    // it still renders identically on screen. Binary bodies pass through
+    // unchanged. `--no-control-characters`, a trusted host, any non-web scheme,
+    // or a binary Content-Type skips this. File output is unaffected.
+    let effective = final_url.as_deref().unwrap_or(&job.url);
+    let scheme = url::Url::parse(effective)
+        .ok()
+        .map(|u| u.scheme().to_ascii_lowercase());
+    let inject = matches!(scheme.as_deref(), Some("http") | Some("https"))
+        && !args.no_control_characters
+        && !trust::url_is_trusted(effective)
+        && content_is_text(content_type.as_deref());
+    let body: ResourceBody = if inject {
+        Box::pin(ControlCharStream::new(body))
+    } else {
+        body
+    };
+
     let mut stdout = tokio::io::stdout();
     if !head.is_empty() {
         if let Err(e) = stdout.write_all(&head).await {
@@ -2015,6 +2238,52 @@ async fn write_all_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injector_separates_every_character() {
+        let mut inj = ControlCharInjector::new();
+        let mut out = Vec::new();
+        out.extend_from_slice(&inj.feed(b"ab"));
+        out.extend_from_slice(&inj.feed(b"c"));
+        out.extend_from_slice(&inj.finish());
+        assert_eq!(out, "a\u{200B}b\u{200B}c".as_bytes());
+    }
+
+    #[test]
+    fn injector_carries_split_multibyte_char() {
+        // "你" is E4 BD A0, split across two chunks.
+        let mut inj = ControlCharInjector::new();
+        let out = inj.feed(&[0xE4, 0xBD]);
+        assert!(out.is_empty(), "incomplete prefix must be held back");
+        let out = inj.feed(&[0xA0]);
+        assert_eq!(out, "你".as_bytes());
+        assert!(inj.finish().is_empty());
+    }
+
+    #[test]
+    fn injector_passes_invalid_bytes_through() {
+        let mut inj = ControlCharInjector::new();
+        // 0xFF is never valid UTF-8; it must survive verbatim.
+        let out = inj.feed(&[b'a', 0xFF, b'b']);
+        assert_eq!(out, b"a\xFF\xE2\x80\x8Bb".to_vec());
+    }
+
+    #[test]
+    fn content_is_text_classifies_mime() {
+        // Unknown / missing / text types are guarded.
+        assert!(content_is_text(None));
+        assert!(content_is_text(Some("")));
+        assert!(content_is_text(Some("text/html; charset=utf-8")));
+        assert!(content_is_text(Some("text/x-shellscript")));
+        assert!(content_is_text(Some("application/json")));
+        assert!(content_is_text(Some("application/ld+json")));
+        assert!(content_is_text(Some("image/svg+xml")));
+        // Binary types are passed through verbatim.
+        assert!(!content_is_text(Some("application/octet-stream")));
+        assert!(!content_is_text(Some("image/png")));
+        assert!(!content_is_text(Some("application/zip")));
+        assert!(!content_is_text(Some("video/mp4")));
+    }
 
     #[test]
     fn hash_algo_parse_and_digest() {

@@ -6,6 +6,7 @@ mod dns;
 mod http;
 mod i18n;
 mod protocol;
+mod trust;
 mod udp;
 mod ui;
 mod ws;
@@ -15,7 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
@@ -42,7 +42,7 @@ struct Ctx {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args = Args::parse_localized();
     std::process::exit(run(args).await);
 }
 
