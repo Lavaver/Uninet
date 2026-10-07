@@ -56,7 +56,7 @@ reporting, checksum verification, resume, retry, and file-lock handling.
 The project requires a recent stable Rust toolchain (edition 2024).
 
 ```sh
-git clone <repository-url> && cd webclient
+git clone https://github.com/Lavaver/Uninet && cd webclient
 cargo build --release
 ```
 
